@@ -3,7 +3,6 @@ import {
   pollQwenDeviceToken,
   type QwenOAuthOptions,
 } from "../../qwen/oauth";
-import type { AuthMethod, OAuthAuthorizationResult } from "../types";
 
 export interface OAuthFlowResult {
   refresh: string;
@@ -12,45 +11,7 @@ export interface OAuthFlowResult {
   resourceUrl?: string;
 }
 
-export function createOAuthMethod(options: QwenOAuthOptions): AuthMethod {
-  return {
-    label: "Qwen OAuth",
-    type: "oauth",
-    async authorize(): Promise<OAuthAuthorizationResult> {
-      const device = await authorizeQwenDevice(options);
-      const url = device.verificationUriComplete ?? device.verificationUri;
-      const instructions = `Open ${device.verificationUri} and enter code ${device.userCode}`;
-
-      return {
-        url,
-        method: "auto",
-        instructions,
-        async callback() {
-          const result = await pollQwenDeviceToken(
-            options,
-            device.deviceCode,
-            device.intervalSeconds,
-            device.expiresAt,
-            device.codeVerifier,
-          );
-
-          if (result.type === "success") {
-            return {
-              type: "success",
-              refresh: result.refresh,
-              access: result.access,
-              expires: result.expires,
-              resourceUrl: result.resourceUrl,
-            };
-          }
-
-          return { type: "failed", error: result.error };
-        },
-      };
-    },
-  };
-}
-
+/** Runs the full device flow headlessly, for callers that do not register a method. */
 export async function executeOAuthFlow(
   options: QwenOAuthOptions,
 ): Promise<OAuthFlowResult> {

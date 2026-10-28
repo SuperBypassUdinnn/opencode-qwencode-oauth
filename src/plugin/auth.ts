@@ -1,4 +1,9 @@
-import type { AuthDetails, OAuthAuthDetails } from "./types";
+import type { OAuthAuthDetails } from "./types";
+
+export interface AuthDetails {
+  type: string;
+  [key: string]: unknown;
+}
 
 /**
  * Rejects empty values and placeholder strings often produced when
@@ -13,7 +18,9 @@ export function isValidOAuthRefreshToken(value: unknown): value is string {
   );
 }
 
-export function isOAuthAuth(auth: AuthDetails): auth is OAuthAuthDetails {
+export function isOAuthAuth(
+  auth: AuthDetails,
+): auth is OAuthAuthDetails & AuthDetails {
   return (
     auth.type === "oauth" &&
     isValidOAuthRefreshToken((auth as { refresh?: unknown }).refresh)

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { accessTokenExpired, isOAuthAuth } from "../src/plugin/auth";
-import type { AuthDetails } from "../src/plugin/types";
+import {
+  type AuthDetails,
+  accessTokenExpired,
+  isOAuthAuth,
+} from "../src/plugin/auth";
 
 const baseAuth = {
   type: "oauth" as const,

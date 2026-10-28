@@ -1,6 +1,6 @@
 import { type QwenOAuthOptions, refreshQwenToken } from "../qwen/oauth";
 import { isValidOAuthRefreshToken } from "./auth";
-import type { OAuthAuthDetails, PluginClient } from "./types";
+import type { OAuthAuthDetails } from "./types";
 
 export class QwenTokenRefreshError extends Error {
   code?: string;
@@ -15,8 +15,6 @@ export class QwenTokenRefreshError extends Error {
 export async function refreshAccessToken(
   auth: OAuthAuthDetails,
   options: QwenOAuthOptions,
-  client: PluginClient,
-  providerId: string,
 ): Promise<OAuthAuthDetails | null> {
   if (!isValidOAuthRefreshToken(auth.refresh)) {
     throw new QwenTokenRefreshError(
@@ -30,20 +28,11 @@ export async function refreshAccessToken(
     throw new QwenTokenRefreshError(result.error, result.code);
   }
 
-  const updated: OAuthAuthDetails = {
+  return {
     type: "oauth",
     refresh: result.refresh,
     access: result.access,
     expires: result.expires,
     resourceUrl: result.resourceUrl ?? auth.resourceUrl,
   };
-
-  const body = updated as Parameters<PluginClient["auth"]["set"]>[0]["body"];
-
-  await client.auth.set({
-    path: { id: providerId },
-    body,
-  });
-
-  return updated;
 }

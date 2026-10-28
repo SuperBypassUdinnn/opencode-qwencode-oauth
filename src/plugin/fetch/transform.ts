@@ -12,6 +12,57 @@ export function sanitizeMalformedUrl(url: string): string {
   return result;
 }
 
+export function applyResourceUrl(
+  input: RequestInfo | URL,
+  baseUrl?: string,
+): { url: string } {
+  let rawUrl: string;
+  if (typeof input === "string") {
+    rawUrl = input;
+  } else if (input instanceof URL) {
+    rawUrl = input.toString();
+  } else {
+    rawUrl = (input as Request).url;
+  }
+
+  rawUrl = sanitizeMalformedUrl(rawUrl);
+
+  if (!rawUrl) {
+    rawUrl = "/";
+  }
+
+  let originalUrl: URL;
+  try {
+    originalUrl = new URL(rawUrl);
+  } catch {
+    if (!baseUrl) {
+      throw new Error(`Qwen OAuth requires a base URL for ${rawUrl}`);
+    }
+    originalUrl = new URL(rawUrl, baseUrl);
+  }
+
+  if (!baseUrl) {
+    return { url: originalUrl.toString() };
+  }
+
+  const base = new URL(baseUrl);
+  const basePath = base.pathname.replace(/\/$/, "");
+  const originalPath = originalUrl.pathname;
+
+  let combinedPath = originalPath;
+  if (originalPath.startsWith(basePath)) {
+    combinedPath = `${basePath}${originalPath.slice(basePath.length)}`;
+  } else {
+    combinedPath = `${basePath}${originalPath.startsWith("/") ? "" : "/"}${originalPath}`;
+  }
+
+  base.pathname = combinedPath;
+  base.search = originalUrl.search;
+  base.hash = originalUrl.hash;
+
+  return { url: base.toString() };
+}
+
 export interface TransformResult {
   url: string;
   init: RequestInit;

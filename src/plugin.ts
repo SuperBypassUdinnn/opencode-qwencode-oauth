@@ -1,22 +1,26 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import { type Credential, Plugin } from "@opencode/plugin";
 import { QWEN_DEFAULT_SCOPES, QWEN_OAUTH_BASE_URL } from "./constants";
 import {
-  type AccountStorage,
   getMinRateLimitWait,
   loadAccounts,
   loadTrackerState,
   markRateLimited,
   recordFailure,
   recordSuccess,
-  type SelectAccountOptions,
   saveAccounts,
   saveTrackerState,
   selectAccount,
   updateAccount,
-  upsertAccount,
 } from "./plugin/account";
-import { accessTokenExpired, isOAuthAuth } from "./plugin/auth";
+import { accessTokenExpired } from "./plugin/auth";
 import { type LoadedConfig, loadConfig } from "./plugin/config";
+import { sleep } from "./plugin/fetch/rate-limit";
+import {
+  RATE_LIMIT_BACKOFF_MS,
+  retryDecision,
+  SERVER_ERROR_BACKOFF_MS,
+} from "./plugin/fetch/retry";
+import { transformRequestAsync } from "./plugin/fetch/transform";
 import {
   createLogger,
   initDebugFromEnv,
@@ -30,21 +34,10 @@ import {
   initHealthTracker,
   initTokenTracker,
 } from "./plugin/rotation";
-import { type QwenTokenRefreshError, refreshAccessToken } from "./plugin/token";
-import type {
-  AuthDetails,
-  GetAuth,
-  OAuthAuthDetails,
-  PluginContext,
-  Provider,
-} from "./plugin/types";
-import {
-  authorizeQwenDevice,
-  pollQwenDeviceToken,
-  type QwenOAuthOptions,
-} from "./qwen/oauth";
+import { refreshAccessToken } from "./plugin/token";
+import type { OAuthAuthDetails } from "./plugin/types";
+import { authorizeQwenDevice, pollQwenDeviceToken } from "./qwen/oauth";
 import { transformHeader } from "./transform/header";
-import { transformResponsesToChatCompletions } from "./transform/request";
 import {
   createTransformContext,
   transformChatCompletionsToResponses,
@@ -56,188 +49,77 @@ import {
 
 const logger = createLogger("plugin");
 
-function normalizeUrl(value: string | undefined, fallback: string): string {
-  if (typeof value !== "string") {
-    return fallback;
-  }
-  const trimmed = value.trim();
-  if (!trimmed) return fallback;
-  if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-    return trimmed;
-  }
-  return `https://${trimmed}`;
+const PROVIDER_ID = "qwen";
+const INTEGRATION_ID = PROVIDER_ID;
+const OAUTH_METHOD_ID = "device";
+
+type PendingRequest = {
+  needsResponsesTransform: boolean;
+  accountIndex: number;
+  at: number;
+};
+
+/**
+ * Request-side state consumed by the matching response hook. Entries are keyed
+ * both by the outbound URL (exact) and by session + kind (fallback), because
+ * the response event reports its own view of the request. The URL key keeps
+ * concurrent calls of the same kind apart; the fallback keeps attribution
+ * working if the reported URL differs.
+ */
+const pending = new Map<string, PendingRequest>();
+
+function requestKey(sessionID: string, kind: string, url?: string): string {
+  return url ? `${sessionID}:${kind}:${url}` : `${sessionID}:${kind}`;
 }
 
-function buildOAuthOptions(
-  config: ReturnType<typeof loadConfig>,
-): QwenOAuthOptions {
+function rememberPending(
+  sessionID: string,
+  kind: string,
+  url: string,
+  meta: PendingRequest,
+): void {
+  pending.set(requestKey(sessionID, kind, url), meta);
+  pending.set(requestKey(sessionID, kind), meta);
+}
+
+function takePending(
+  sessionID: string,
+  kind: string,
+  url: string,
+): PendingRequest | undefined {
+  const exact = requestKey(sessionID, kind, url);
+  const meta = pending.get(exact) ?? pending.get(requestKey(sessionID, kind));
+  pending.delete(exact);
+  pending.delete(requestKey(sessionID, kind));
+  return meta;
+}
+
+function pruneStale(): void {
+  const cutoff = Date.now() - 5 * 60_000;
+  for (const [key, value] of pending) {
+    if (value.at < cutoff) pending.delete(key);
+  }
+}
+
+function buildOAuthOptions(config: LoadedConfig): {
+  clientId: string;
+  oauthBaseUrl: string;
+  scopes: string[];
+} {
+  const base = (config.oauth_base_url ?? "").trim();
+  const oauthBaseUrl =
+    base.startsWith("http://") || base.startsWith("https://")
+      ? base
+      : QWEN_OAUTH_BASE_URL;
   return {
     clientId: config.client_id,
-    oauthBaseUrl: normalizeUrl(config.oauth_base_url, QWEN_OAUTH_BASE_URL),
+    oauthBaseUrl,
     scopes: QWEN_DEFAULT_SCOPES,
   };
 }
 
-function ensureStorage(auth: OAuthAuthDetails): AccountStorage {
-  return {
-    version: 1,
-    accounts: [
-      {
-        refreshToken: auth.refresh,
-        accessToken: auth.access,
-        expires: auth.expires,
-        resourceUrl: auth.resourceUrl,
-        addedAt: Date.now(),
-        lastUsed: Date.now(),
-      },
-    ],
-    activeIndex: 0,
-  };
-}
-
-function sanitizeMalformedUrl(url: string): string {
-  let result = url.trim();
-
-  // Strip leading sentinel prefix (undefined/null) only at start
-  // OpenCode may pass "undefined/chat/completions" when provider has no baseUrl
-  result = result.replace(/^(undefined|null)(?=\/|$)/, "");
-
-  // Prevent protocol-relative URL after stripping (e.g., "undefined//path" -> "//path" is dangerous)
-  // Collapse multiple leading slashes to single slash
-  if (result.startsWith("//")) {
-    result = `/${result.replace(/^\/+/, "")}`;
-  }
-
-  return result;
-}
-
-function applyResourceUrl(
-  input: RequestInfo | URL,
-  baseUrl?: string,
-): { url: string } {
-  let rawUrl: string;
-  if (typeof input === "string") {
-    rawUrl = input;
-  } else if (input instanceof URL) {
-    rawUrl = input.toString();
-  } else {
-    rawUrl = input.url;
-  }
-
-  // Sanitize malformed URLs from OpenCode (e.g., "undefined/chat/completions")
-  rawUrl = sanitizeMalformedUrl(rawUrl);
-
-  // If sanitization resulted in empty string, treat as root path
-  if (!rawUrl) {
-    rawUrl = "/";
-  }
-
-  let originalUrl: URL;
-  try {
-    originalUrl = new URL(rawUrl);
-  } catch {
-    if (!baseUrl) {
-      throw new Error(`Qwen OAuth requires a base URL for ${rawUrl}`);
-    }
-    originalUrl = new URL(rawUrl, baseUrl);
-  }
-
-  if (!baseUrl) {
-    return { url: originalUrl.toString() };
-  }
-
-  const base = new URL(baseUrl);
-  const basePath = base.pathname.replace(/\/$/, "");
-  const originalPath = originalUrl.pathname;
-
-  let combinedPath = originalPath;
-  if (originalPath.startsWith(basePath)) {
-    combinedPath = `${basePath}${originalPath.slice(basePath.length)}`;
-  } else {
-    combinedPath = `${basePath}${originalPath.startsWith("/") ? "" : "/"}${originalPath}`;
-  }
-
-  base.pathname = combinedPath;
-  base.search = originalUrl.search;
-  base.hash = originalUrl.hash;
-
-  return { url: base.toString() };
-}
-
-function extractRetryAfterMs(response: Response): number | null {
-  const retryAfterMs = response.headers.get("retry-after-ms");
-  if (retryAfterMs) {
-    const value = Number.parseInt(retryAfterMs, 10);
-    if (!Number.isNaN(value) && value > 0) {
-      return value;
-    }
-  }
-
-  const retryAfter = response.headers.get("retry-after");
-  if (retryAfter) {
-    const value = Number.parseInt(retryAfter, 10);
-    if (!Number.isNaN(value) && value > 0) {
-      return value * 1000;
-    }
-  }
-
-  return null;
-}
-
-type RateLimitReason =
-  | "QUOTA_EXHAUSTED"
-  | "RATE_LIMIT_EXCEEDED"
-  | "SERVER_ERROR"
-  | "UNKNOWN";
-
-const BACKOFF_TIERS: Record<RateLimitReason, number[]> = {
-  QUOTA_EXHAUSTED: [60_000, 300_000, 1800_000],
-  RATE_LIMIT_EXCEEDED: [30_000, 60_000],
-  SERVER_ERROR: [20_000, 40_000],
-  UNKNOWN: [60_000],
-};
-
-function parseRateLimitReason(response: Response): RateLimitReason {
-  const errorHeader = response.headers.get("x-error-code");
-  if (errorHeader) {
-    const upper = errorHeader.toUpperCase();
-    if (upper.includes("QUOTA")) return "QUOTA_EXHAUSTED";
-    if (upper.includes("RATE")) return "RATE_LIMIT_EXCEEDED";
-    if (upper.includes("SERVER") || upper.includes("CAPACITY"))
-      return "SERVER_ERROR";
-  }
-  if (response.status >= 500) return "SERVER_ERROR";
-  return "UNKNOWN";
-}
-
-function getBackoffMs(
-  reason: RateLimitReason,
-  consecutiveFailures: number,
-): number {
-  const tier = BACKOFF_TIERS[reason];
-  return tier[Math.min(consecutiveFailures, tier.length - 1)];
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function ensureAuthInStorage(
-  storage: AccountStorage | null,
-  auth: OAuthAuthDetails,
-): Promise<AccountStorage> {
-  const now = Date.now();
-  const baseStorage = storage ?? ensureStorage(auth);
-  const updated = upsertAccount(baseStorage, {
-    refreshToken: auth.refresh,
-    accessToken: auth.access,
-    expires: auth.expires,
-    resourceUrl: auth.resourceUrl,
-    addedAt: now,
-    lastUsed: now,
-  });
-  await saveAccounts(updated);
-  return updated;
+function getPidOffset(config: LoadedConfig): number {
+  return config.pid_offset_enabled ? process.pid : 0;
 }
 
 function initializeTrackers(config: LoadedConfig): void {
@@ -273,18 +155,38 @@ function initializeTrackers(config: LoadedConfig): void {
   }
 }
 
-function getPidOffset(config: LoadedConfig): number {
-  if (!config.pid_offset_enabled) return 0;
-  return process.pid;
+// Credential.OAuth has no first-class resourceUrl, so it travels in metadata.
+function extractResourceUrl(credential: Credential.OAuth): string | undefined {
+  const meta = credential.metadata as Record<string, unknown> | undefined;
+  const value = meta?.resourceUrl;
+  return typeof value === "string" ? value : undefined;
 }
 
-export const createQwenOAuthPlugin =
-  (providerId: string): Plugin =>
-  async ({ client, directory }: PluginContext) => {
-    const config = loadConfig(directory);
+function toCredentialOAuth(
+  auth: OAuthAuthDetails,
+  methodID: Credential.OAuth["methodID"],
+): Credential.OAuth {
+  return {
+    type: "oauth",
+    methodID,
+    refresh: auth.refresh,
+    access: auth.access ?? "",
+    expires: auth.expires ?? 0,
+    ...(auth.resourceUrl
+      ? { metadata: { resourceUrl: auth.resourceUrl } }
+      : {}),
+  };
+}
+
+export const QwenOAuthPlugin = Plugin.define({
+  id: INTEGRATION_ID,
+
+  async setup(ctx) {
+    const config = loadConfig(ctx.location.directory);
     setLoggerQuietMode(config.quiet_mode);
     initDebugFromEnv();
     initializeTrackers(config);
+
     const existingStorage = await loadAccounts();
     await loadTrackerState(
       getHealthTracker(),
@@ -293,419 +195,329 @@ export const createQwenOAuthPlugin =
     );
 
     const pidOffset = getPidOffset(config);
+    const oauthOptions = buildOAuthOptions(config);
+    const refreshBuffer = config.proactive_refresh
+      ? config.refresh_window_seconds
+      : 0;
+    const maxRateLimitWaitMs = config.max_rate_limit_wait_seconds * 1000;
+
     logger.debug("Plugin initialized", {
-      providerId,
-      directory,
+      providerId: PROVIDER_ID,
       strategy: config.rotation_strategy,
       pidOffset: config.pid_offset_enabled ? pidOffset : "disabled",
     });
 
-    const oauthOptions = buildOAuthOptions(config);
+    await ctx.integration.transform((editor) => {
+      editor.method.update({
+        integrationID: INTEGRATION_ID,
+        method: {
+          id: OAUTH_METHOD_ID,
+          type: "oauth",
+          label: "Qwen OAuth",
+        },
+        authorize: async () => {
+          const device = await authorizeQwenDevice(oauthOptions);
+          const url = device.verificationUriComplete ?? device.verificationUri;
 
-    return {
-      auth: {
-        provider: providerId,
-        async loader(getAuth: GetAuth, provider: Provider) {
-          const auth = (await getAuth()) as AuthDetails;
-          if (!isOAuthAuth(auth)) {
-            return {};
+          return {
+            url,
+            instructions: `Open ${device.verificationUri} and enter code ${device.userCode}`,
+            mode: "auto" as const,
+            callback: (async (): Promise<Credential.OAuth> => {
+              const result = await pollQwenDeviceToken(
+                oauthOptions,
+                device.deviceCode,
+                device.intervalSeconds,
+                device.expiresAt,
+                device.codeVerifier,
+              );
+              if (result.type === "failed") throw new Error(result.error);
+              return toCredentialOAuth(
+                {
+                  type: "oauth",
+                  refresh: result.refresh,
+                  access: result.access,
+                  expires: result.expires,
+                  resourceUrl: result.resourceUrl,
+                },
+                OAUTH_METHOD_ID as Credential.OAuth["methodID"],
+              );
+            })(),
+          };
+        },
+        refresh: async (
+          credential: Credential.OAuth,
+        ): Promise<Credential.OAuth> => {
+          const refreshed = await refreshAccessToken(
+            {
+              type: "oauth",
+              refresh: credential.refresh,
+              access: credential.access,
+              expires: credential.expires,
+              resourceUrl: extractResourceUrl(credential),
+            },
+            oauthOptions,
+          );
+          if (!refreshed) throw new Error("Token refresh returned null");
+          return toCredentialOAuth(refreshed, credential.methodID);
+        },
+        label: (credential: Credential.OAuth) => {
+          const resourceUrl = extractResourceUrl(credential);
+          if (!resourceUrl) return undefined;
+          try {
+            return new URL(resourceUrl).hostname;
+          } catch {
+            return undefined;
           }
+        },
+      });
+    });
 
-          let accountStorage = await ensureAuthInStorage(
-            existingStorage ?? (await loadAccounts()),
-            auth,
+    // Request side: pick an account, refresh its token when due, rewrite the
+    // Responses call into a Chat Completions call, and attach the bearer token.
+    const requestHook = await ctx.session.hook(
+      "http.request",
+      async (event) => {
+        if (event.model.providerID !== PROVIDER_ID) return;
+
+        pruneStale();
+
+        const storage = await loadAccounts();
+        if (!storage || storage.accounts.length === 0) {
+          logger.debug("No Qwen accounts stored; leaving request untouched");
+          return;
+        }
+
+        let accountStorage = storage;
+        const startedAt = Date.now();
+        let attempts = 0;
+
+        // Select an account, refresh its token, and hand the request to it. A
+        // revoked refresh token disqualifies only that account, so the loop
+        // moves on instead of failing the whole request.
+        while (true) {
+          const now = Date.now();
+          const selection = selectAccount(
+            accountStorage,
+            config.rotation_strategy,
+            now,
+            {
+              healthTracker: getHealthTracker(),
+              tokenTracker: getTokenTracker(),
+              adaptiveTracker: getAdaptiveTracker(),
+              pidOffset,
+            },
           );
 
-          if (provider.models) {
-            for (const model of Object.values(provider.models)) {
-              if (model) {
-                model.cost = {
-                  input: 0,
-                  output: 0,
-                  cache: { read: 0, write: 0 },
-                };
+          if (!selection) {
+            const waitMs = getMinRateLimitWait(accountStorage, now);
+            if (!waitMs) {
+              throw new Error(
+                "Qwen OAuth: no usable account (all require re-authentication).",
+              );
+            }
+            if (
+              maxRateLimitWaitMs > 0 &&
+              now - startedAt + waitMs > maxRateLimitWaitMs
+            ) {
+              throw new Error(
+                "Qwen OAuth: all accounts are rate-limited. Try again later.",
+              );
+            }
+            logger.debug("All Qwen accounts rate-limited; waiting", { waitMs });
+            await sleep(waitMs);
+            continue;
+          }
+
+          accountStorage = selection.storage;
+          const account = selection.account;
+
+          let auth: OAuthAuthDetails = {
+            type: "oauth",
+            refresh: account.refreshToken,
+            access: account.accessToken,
+            expires: account.expires,
+            resourceUrl: account.resourceUrl,
+          };
+
+          if (!auth.access || accessTokenExpired(auth, refreshBuffer)) {
+            try {
+              const refreshed = await refreshAccessToken(auth, oauthOptions);
+              if (!refreshed) throw new Error("Token refresh failed");
+              auth = refreshed;
+              accountStorage = updateAccount(accountStorage, selection.index, {
+                refreshToken: refreshed.refresh,
+                accessToken: refreshed.access,
+                expires: refreshed.expires,
+                resourceUrl: refreshed.resourceUrl ?? account.resourceUrl,
+                lastUsed: now,
+              });
+            } catch (error) {
+              const code = (error as { code?: string }).code ?? "";
+              const revoked =
+                code === "invalid_grant" || code === "invalid_token";
+              if (revoked) {
+                accountStorage = updateAccount(
+                  accountStorage,
+                  selection.index,
+                  {
+                    requiresReauth: true,
+                    accessToken: undefined,
+                    expires: undefined,
+                  },
+                );
+                await saveAccounts(accountStorage);
+                attempts += 1;
+                if (attempts >= accountStorage.accounts.length) throw error;
+                continue;
               }
+              throw error;
             }
           }
 
-          return {
-            apiKey: "",
-            fetch: async (
-              input: RequestInfo | URL,
-              init?: RequestInit,
-            ): Promise<Response> => {
-              let attempts = 0;
-              const healthTracker = getHealthTracker();
-              const tokenTracker = getTokenTracker();
-              const adaptiveTracker = getAdaptiveTracker();
-              const selectOptions: SelectAccountOptions = {
-                healthTracker,
-                tokenTracker,
-                adaptiveTracker,
-                pidOffset,
-              };
+          const transformed = await transformRequestAsync(event.request);
+          const headers = transformHeader(transformed.init.headers, {
+            accessToken: auth.access,
+            forceJsonContentType: transformed.needsResponsesTransform,
+          });
 
-              while (true) {
-                const now = Date.now();
-                const selection = selectAccount(
-                  accountStorage,
-                  config.rotation_strategy,
-                  now,
-                  selectOptions,
-                );
+          const outbound = new Request(transformed.url, {
+            ...transformed.init,
+            headers,
+          });
+          event.request = outbound;
 
-                if (!selection) {
-                  const waitMs = getMinRateLimitWait(accountStorage, now);
-                  if (!waitMs) {
-                    throw new Error(
-                      "No available Qwen OAuth accounts. Re-authenticate to continue.",
-                    );
-                  }
+          rememberPending(event.sessionID, event.kind, outbound.url, {
+            needsResponsesTransform: transformed.needsResponsesTransform,
+            accountIndex: selection.index,
+            at: Date.now(),
+          });
 
-                  const maxWaitMs =
-                    (config.max_rate_limit_wait_seconds ?? 0) * 1000;
-                  if (maxWaitMs > 0 && waitMs > maxWaitMs) {
-                    throw new Error(
-                      "All Qwen OAuth accounts are rate-limited. Try again later.",
-                    );
-                  }
-
-                  await sleep(waitMs);
-                  continue;
-                }
-
-                accountStorage = selection.storage;
-                const account = selection.account;
-                const accountIndex = selection.index;
-
-                let activeAuth: OAuthAuthDetails = {
-                  type: "oauth",
-                  refresh: account.refreshToken,
-                  access: account.accessToken,
-                  expires: account.expires,
-                  resourceUrl: account.resourceUrl,
-                };
-
-                const refreshBuffer = config.proactive_refresh
-                  ? config.refresh_window_seconds
-                  : 0;
-                if (
-                  !activeAuth.access ||
-                  accessTokenExpired(activeAuth, refreshBuffer)
-                ) {
-                  logger.debug("Token refresh needed", {
-                    accountIndex,
-                    hasAccess: !!activeAuth.access,
-                    proactive: config.proactive_refresh,
-                  });
-                  try {
-                    const refreshed = await refreshAccessToken(
-                      activeAuth,
-                      oauthOptions,
-                      client,
-                      providerId,
-                    );
-                    if (!refreshed) {
-                      throw new Error("Token refresh failed");
-                    }
-                    logger.debug("Token refreshed successfully", {
-                      accountIndex,
-                    });
-                    activeAuth = {
-                      type: "oauth",
-                      refresh: refreshed.refresh,
-                      access: refreshed.access,
-                      expires: refreshed.expires,
-                      resourceUrl: refreshed.resourceUrl ?? account.resourceUrl,
-                    };
-                    accountStorage = updateAccount(
-                      accountStorage,
-                      accountIndex,
-                      {
-                        refreshToken: refreshed.refresh,
-                        accessToken: refreshed.access,
-                        expires: refreshed.expires,
-                        resourceUrl:
-                          refreshed.resourceUrl ?? account.resourceUrl,
-                        lastUsed: now,
-                      },
-                    );
-                    await saveAccounts(accountStorage);
-                  } catch (error) {
-                    const refreshError = error as QwenTokenRefreshError;
-                    logger.debug("Token refresh failed", {
-                      accountIndex,
-                      code: refreshError.code,
-                    });
-                    const permanentTokenErrors = [
-                      "invalid_grant",
-                      "invalid_token",
-                    ];
-                    if (
-                      permanentTokenErrors.includes(refreshError.code ?? "")
-                    ) {
-                      logger.debug(
-                        "Refresh token revoked for account, marking as requiresReauth",
-                        { accountIndex },
-                      );
-                      accountStorage = updateAccount(
-                        accountStorage,
-                        accountIndex,
-                        {
-                          requiresReauth: true,
-                          accessToken: undefined,
-                          expires: undefined,
-                        },
-                      );
-                      await saveAccounts(accountStorage);
-                      attempts += 1;
-                      if (attempts >= accountStorage.accounts.length) {
-                        throw error;
-                      }
-                      continue;
-                    }
-                    throw error;
-                  }
-                }
-
-                // Get URL from input - OpenCode already constructs full URLs
-                let rawUrl: string;
-                if (typeof input === "string") {
-                  rawUrl = input;
-                } else if (input instanceof URL) {
-                  rawUrl = input.toString();
-                } else {
-                  rawUrl = input.url;
-                }
-
-                // Sanitize malformed URLs (e.g., "undefined/path")
-                rawUrl = sanitizeMalformedUrl(rawUrl);
-
-                let requestInit =
-                  init ??
-                  (input instanceof Request
-                    ? {
-                        method: input.method,
-                        headers: input.headers,
-                        body: input.body,
-                        signal: input.signal,
-                      }
-                    : undefined);
-
-                if (!requestInit && !(input instanceof Request)) {
-                  requestInit = {};
-                }
-
-                const needsResponsesTransform = rawUrl.endsWith("/responses");
-                const finalUrl = rawUrl.replace(
-                  /\/responses$/,
-                  "/chat/completions",
-                );
-
-                const finalInit = { ...requestInit };
-                if (needsResponsesTransform && requestInit?.body) {
-                  let backupStream: ReadableStream | null = null;
-                  try {
-                    let bodyStr: string;
-                    if (typeof requestInit.body === "string") {
-                      bodyStr = requestInit.body;
-                    } else if (requestInit.body instanceof ReadableStream) {
-                      const [readStream, backup] = requestInit.body.tee();
-                      backupStream = backup;
-                      bodyStr = await new Response(readStream).text();
-                    } else {
-                      bodyStr = await new Response(requestInit.body).text();
-                    }
-                    const body = JSON.parse(bodyStr);
-                    const transformed =
-                      transformResponsesToChatCompletions(body);
-                    finalInit.body = JSON.stringify(transformed);
-                    logger.verbose("Transformed request body", {
-                      messagesCount: transformed.messages?.length,
-                      hasTools: !!transformed.tools,
-                    });
-                  } catch {
-                    if (backupStream) {
-                      finalInit.body = backupStream;
-                    }
-                    logger.debug("Body parse failed, using original");
-                  }
-                }
-
-                const headers = transformHeader(requestInit?.headers, {
-                  accessToken: activeAuth.access,
-                  forceJsonContentType: needsResponsesTransform,
-                });
-
-                logger.debug("Sending request", {
-                  url: finalUrl,
-                  method: finalInit.method ?? "POST",
-                  needsTransform: needsResponsesTransform,
-                });
-
-                const response = await fetch(finalUrl, {
-                  ...finalInit,
-                  headers,
-                });
-
-                logger.debug("Response received", {
-                  status: response.status,
-                  contentType: response.headers.get("content-type"),
-                });
-
-                // Transform streaming response from Chat Completions to Responses API format
-                if (
-                  needsResponsesTransform &&
-                  response.ok &&
-                  response.body &&
-                  response.headers
-                    .get("content-type")
-                    ?.includes("text/event-stream")
-                ) {
-                  const sseCtx = createSSETransformContext(logger);
-                  const transformStream = createSSETransformStream(sseCtx);
-                  const transformedBody =
-                    response.body.pipeThrough(transformStream);
-                  return new Response(transformedBody, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers,
-                  });
-                }
-
-                if (
-                  needsResponsesTransform &&
-                  response.ok &&
-                  !response.headers
-                    .get("content-type")
-                    ?.includes("text/event-stream")
-                ) {
-                  logger.debug("Transforming non-streaming response");
-                  const chatBody = await response.json();
-                  const ctx = createTransformContext();
-                  const responsesBody = transformChatCompletionsToResponses(
-                    chatBody,
-                    ctx,
-                  );
-
-                  return new Response(JSON.stringify(responsesBody), {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: new Headers({
-                      "content-type": "application/json",
-                    }),
-                  });
-                }
-
-                if (response.status === 429 || response.status >= 500) {
-                  const reason = parseRateLimitReason(response);
-                  const headerMs = extractRetryAfterMs(response);
-                  const tieredMs = getBackoffMs(reason, attempts);
-                  const retryAfterMs = headerMs ?? tieredMs;
-
-                  logger.debug("Rate limited or server error", {
-                    status: response.status,
-                    reason,
-                    accountIndex,
-                    retryAfterMs,
-                    attempts,
-                    totalAccounts: accountStorage.accounts.length,
-                  });
-
-                  accountStorage = markRateLimited(
-                    accountStorage,
-                    accountIndex,
-                    retryAfterMs,
-                  );
-                  accountStorage = recordFailure(accountStorage, accountIndex);
-                  if (response.status === 429) {
-                    healthTracker.recordRateLimit(accountIndex);
-                    if (config.rotation_strategy === "adaptive") {
-                      adaptiveTracker.recordRateLimit(accountIndex);
-                    }
-                  } else {
-                    healthTracker.recordFailure(accountIndex);
-                    if (config.rotation_strategy === "adaptive") {
-                      adaptiveTracker.recordFailure(accountIndex);
-                    }
-                  }
-                  await saveAccounts(accountStorage);
-                  await saveTrackerState(healthTracker, tokenTracker);
-                  attempts += 1;
-                  if (attempts >= accountStorage.accounts.length) {
-                    const waitMs = getMinRateLimitWait(
-                      accountStorage,
-                      Date.now(),
-                    );
-                    if (waitMs) {
-                      logger.debug("All accounts rate limited, waiting", {
-                        waitMs,
-                      });
-                      await sleep(waitMs);
-                      attempts = 0;
-                      continue;
-                    }
-                    return response;
-                  }
-                  continue;
-                }
-
-                accountStorage = recordSuccess(accountStorage, accountIndex);
-                healthTracker.recordSuccess(accountIndex);
-                if (config.rotation_strategy === "adaptive") {
-                  adaptiveTracker.recordSuccess(accountIndex);
-                }
-                await saveAccounts(accountStorage);
-                await saveTrackerState(healthTracker, tokenTracker);
-                return response;
-              }
-            },
-          };
-        },
-        methods: [
-          {
-            label: "Qwen OAuth",
-            type: "oauth",
-            authorize: async () => {
-              const device = await authorizeQwenDevice(oauthOptions);
-              const url =
-                device.verificationUriComplete ?? device.verificationUri;
-              const instructions = `Open ${device.verificationUri} and enter code ${device.userCode}`;
-
-              return {
-                url,
-                method: "auto",
-                instructions,
-                callback: async () => {
-                  const result = await pollQwenDeviceToken(
-                    oauthOptions,
-                    device.deviceCode,
-                    device.intervalSeconds,
-                    device.expiresAt,
-                    device.codeVerifier,
-                  );
-                  if (result.type === "success") {
-                    return {
-                      type: "success",
-                      refresh: result.refresh,
-                      access: result.access,
-                      expires: result.expires,
-                      resourceUrl: result.resourceUrl,
-                    };
-                  }
-                  return { type: "failed", error: result.error };
-                },
-              };
-            },
-          },
-        ],
+          await saveAccounts(accountStorage);
+          return;
+        }
       },
+    );
+
+    // Response side: translate Chat Completions back into the Responses shape
+    // and record per-account health so rotation can react to rate limits.
+    const responseHook = await ctx.session.hook(
+      "http.response",
+      async (event) => {
+        if (event.model.providerID !== PROVIDER_ID) return;
+
+        const meta = takePending(
+          event.sessionID,
+          event.kind,
+          event.request.url,
+        );
+        if (!meta) return;
+
+        const storage = await loadAccounts();
+        const status = event.response.status;
+        const rateLimited = status === 429;
+        const serverError = status >= 500;
+
+        if (storage) {
+          let next = storage;
+          if (rateLimited || serverError) {
+            next = markRateLimited(
+              next,
+              meta.accountIndex,
+              rateLimited ? RATE_LIMIT_BACKOFF_MS : SERVER_ERROR_BACKOFF_MS,
+            );
+            next = recordFailure(next, meta.accountIndex);
+          } else if (event.response.ok) {
+            next = recordSuccess(next, meta.accountIndex);
+          }
+          if (next !== storage) await saveAccounts(next);
+        }
+
+        if (rateLimited) getHealthTracker().recordRateLimit(meta.accountIndex);
+        else if (serverError)
+          getHealthTracker().recordFailure(meta.accountIndex);
+        else if (event.response.ok)
+          getHealthTracker().recordSuccess(meta.accountIndex);
+
+        if (config.rotation_strategy === "adaptive") {
+          const adaptive = getAdaptiveTracker();
+          if (rateLimited) adaptive.recordRateLimit(meta.accountIndex);
+          else if (serverError) adaptive.recordFailure(meta.accountIndex);
+          else if (event.response.ok) adaptive.recordSuccess(meta.accountIndex);
+        }
+
+        if (event.response.ok) {
+          await saveTrackerState(getHealthTracker(), getTokenTracker());
+        }
+
+        if (!meta.needsResponsesTransform || !event.response.ok) return;
+
+        const contentType = event.response.headers.get("content-type") ?? "";
+
+        if (contentType.includes("text/event-stream") && event.response.body) {
+          const sseCtx = createSSETransformContext(logger);
+          const stream = createSSETransformStream(sseCtx);
+          event.response = new Response(
+            event.response.body.pipeThrough(stream),
+            {
+              status: event.response.status,
+              statusText: event.response.statusText,
+              headers: event.response.headers,
+            },
+          );
+          return;
+        }
+
+        try {
+          const chatBody = await event.response.json();
+          const responsesBody = transformChatCompletionsToResponses(
+            chatBody,
+            createTransformContext(),
+          );
+          event.response = new Response(JSON.stringify(responsesBody), {
+            status: event.response.status,
+            statusText: event.response.statusText,
+            headers: new Headers({ "content-type": "application/json" }),
+          });
+        } catch (error) {
+          logger.debug("Response transform skipped", {
+            error: String(error),
+          });
+        }
+      },
+    );
+
+    // Retry side: a 429 or 5xx from one account should rotate to the next
+    // account instead of surfacing to the user. The response hook has already
+    // marked that account rate-limited, so the retried request selects another.
+    const retryHook = await ctx.session.hook(
+      "retry",
+      async (event) => {
+        if (event.model.providerID !== PROVIDER_ID) return;
+
+        event.decision = retryDecision({
+          status: event.error.status,
+          retryAfterMs: event.error.retryAfterMs,
+          attempt: event.attempt,
+          maxWaitMs: maxRateLimitWaitMs,
+        });
+      },
+      { providerID: PROVIDER_ID },
+    );
+
+    logger.info("Qwen OAuth plugin ready", {
+      strategy: config.rotation_strategy,
+      accounts: existingStorage?.accounts.length ?? 0,
+    });
+
+    return () => {
+      requestHook.dispose();
+      responseHook.dispose();
+      retryHook.dispose();
     };
-  };
+  },
+});
 
-export const QwenCLIOAuthPlugin = createQwenOAuthPlugin("qwen");
-export const QwenOAuthPlugin = QwenCLIOAuthPlugin;
-
-export { sanitizeMalformedUrl, applyResourceUrl };
-
+export const QwenCLIOAuthPlugin = QwenOAuthPlugin;
+export const createQwenOAuthPlugin = (_providerId: string) => QwenOAuthPlugin;
 export default QwenOAuthPlugin;

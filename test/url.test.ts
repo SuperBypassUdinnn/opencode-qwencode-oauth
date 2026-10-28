@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { applyResourceUrl, sanitizeMalformedUrl } from "../src/plugin";
+import {
+  applyResourceUrl,
+  sanitizeMalformedUrl,
+} from "../src/plugin/fetch/transform";
 
 describe("sanitizeMalformedUrl", () => {
   it("strips undefined/ prefix", () => {
