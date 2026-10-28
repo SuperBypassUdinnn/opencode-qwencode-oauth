@@ -69,6 +69,43 @@ function createOAuthBody(entries: Record<string, string>): URLSearchParams {
   return new URLSearchParams(entries);
 }
 
+function oauthRequestHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+    "x-request-id": crypto.randomUUID(),
+  };
+}
+
+function parseTokenError(body: string): QwenErrorResponse {
+  try {
+    return JSON.parse(body) as QwenErrorResponse;
+  } catch {
+    return {};
+  }
+}
+
+function describeTokenFailure(
+  response: Response,
+  rawBody: string,
+  payload: QwenErrorResponse,
+): string {
+  const status = response.status;
+  const described = payload.error_description?.trim();
+  if (described) return `${described} (HTTP ${status})`;
+  if (payload.error) return `${payload.error} (HTTP ${status})`;
+
+  const contentType = response.headers.get("content-type") ?? "";
+  const markup =
+    contentType.includes("html") || /^\s*<(?:!doctype|html)/i.test(rawBody);
+  if (markup) {
+    return `Qwen OAuth token request failed (HTTP ${status}): Qwen's edge returned an HTML block page instead of an OAuth error, so the endpoint refused the request. Retry later; if it keeps failing, the endpoint is unavailable rather than your account.`;
+  }
+
+  logger.debug("Unexpected Qwen token response", { status, body: rawBody });
+  return `Qwen OAuth token request failed (HTTP ${status}) with an unexpected response body.`;
+}
+
 function effectiveOAuthBaseUrl(base: string | undefined): string {
   if (typeof base !== "string") {
     return QWEN_OAUTH_BASE_URL;
@@ -132,9 +169,7 @@ export async function authorizeQwenDevice(
     resolveOAuthUrl(oauthBase, QWEN_DEVICE_CODE_ENDPOINT),
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
+      headers: oauthRequestHeaders(),
       body: createOAuthBody({
         client_id: resolveClientId(options.clientId),
         scope: scopes.join(" "),
@@ -182,9 +217,7 @@ export async function pollQwenDeviceToken(
       resolveOAuthUrl(options.oauthBaseUrl, QWEN_TOKEN_ENDPOINT),
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
+        headers: oauthRequestHeaders(),
         body: createOAuthBody({
           client_id: resolveClientId(options.clientId),
           grant_type: "urn:ietf:params:oauth:grant-type:device_code",
@@ -208,9 +241,8 @@ export async function pollQwenDeviceToken(
       };
     }
 
-    const errorPayload = (await response
-      .json()
-      .catch(() => ({}))) as QwenErrorResponse;
+    const rawBody = await response.text();
+    const errorPayload = parseTokenError(rawBody);
     const code = errorPayload.error;
 
     if (code === "authorization_pending") {
@@ -230,8 +262,9 @@ export async function pollQwenDeviceToken(
 
     return {
       type: "failed",
-      error: errorPayload.error_description ?? "OAuth polling failed",
+      error: describeTokenFailure(response, rawBody, errorPayload),
       code,
+      status: response.status,
     };
   }
 
@@ -260,9 +293,7 @@ export async function refreshQwenToken(
   try {
     response = await fetch(resolveOAuthUrl(oauthBase, QWEN_TOKEN_ENDPOINT), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
+      headers: oauthRequestHeaders(),
       body: createOAuthBody({
         client_id: resolveClientId(options.clientId),
         grant_type: "refresh_token",
@@ -280,12 +311,7 @@ export async function refreshQwenToken(
 
   if (!response.ok) {
     const bodyText = await response.text();
-    let errorPayload: QwenErrorResponse = {};
-    try {
-      errorPayload = JSON.parse(bodyText);
-    } catch {
-      // Ignore parse error
-    }
+    const errorPayload = parseTokenError(bodyText);
     logger.debug("Failed to refresh token", {
       url: resolveOAuthUrl(oauthBase, QWEN_TOKEN_ENDPOINT),
       status: response.status,
@@ -298,7 +324,7 @@ export async function refreshQwenToken(
     });
     return {
       type: "failed",
-      error: errorPayload.error_description ?? "Failed to refresh token",
+      error: describeTokenFailure(response, bodyText, errorPayload),
       code: errorPayload.error,
       status: response.status,
     };
